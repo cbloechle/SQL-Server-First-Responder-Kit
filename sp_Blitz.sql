@@ -37,7 +37,7 @@ AS
 	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 	
 
-	SELECT @Version = '7.8', @VersionDate = '20190922';
+	SELECT @Version = '7.94', @VersionDate = '20200324';
 	SET @OutputType = UPPER(@OutputType);
 
     IF(@VersionCheckMode = 1)
@@ -90,9 +90,9 @@ AS
 	tigertoolbox and are provided under the MIT license:
 	https://github.com/Microsoft/tigertoolbox
 	
-	All other copyright for sp_Blitz are held by Brent Ozar Unlimited, 2019.
+	All other copyrights for sp_Blitz are held by Brent Ozar Unlimited, 2020.
 
-	Copyright (c) 2019 Brent Ozar Unlimited
+	Copyright (c) 2020 Brent Ozar Unlimited
 
 	Permission is hereby granted, free of charge, to any person obtaining a copy
 	of this software and associated documentation files (the "Software"), to deal
@@ -180,6 +180,7 @@ AS
             ,@CurrentComponentVersionCheckModeOK     BIT
             ,@canExitLoop                            BIT
             ,@frkIsConsistent                        BIT
+			,@NeedToTurnNumericRoundabortBackOn      BIT;
             
             /* End of declarations for First Responder Kit consistency check:*/
         ;
@@ -194,7 +195,25 @@ AS
 		
 		IF @DaysUptime = 0
 		    SET @DaysUptime = .01;
-		
+
+		/* 
+		Set the session state of Numeric_RoundAbort to off if any databases have Numeric Round-Abort enabled.  
+		Stops arithmetic overflow errors during data conversion. See Github issue #2302 for more info.
+		*/
+		IF ( (8192 & @@OPTIONS) = 8192 ) /* Numeric RoundAbort is currently on, so we may need to turn it off temporarily */
+			BEGIN
+			IF EXISTS (SELECT 1 
+							FROM sys.databases
+							WHERE is_numeric_roundabort_on = 1) /* A database has it turned on */
+				BEGIN
+				SET @NeedToTurnNumericRoundabortBackOn = 1;
+				SET NUMERIC_ROUNDABORT OFF;
+				END;
+			END;
+	
+
+
+
 		/*
 		--TOURSTOP01--
 		See https://www.BrentOzar.com/go/blitztour for a guided tour.
@@ -854,7 +873,7 @@ AS
 
 						IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 1) WITH NOWAIT;
 
-                        IF SERVERPROPERTY('EngineName') <> 8 /* Azure Managed Instances need a special query */
+                        IF SERVERPROPERTY('EngineEdition') <> 8 /* Azure Managed Instances need a special query */
                             BEGIN
 						    INSERT  INTO #BlitzResults
 								    ( CheckID ,
@@ -3539,12 +3558,13 @@ AS
                             AND SERVERPROPERTY('EngineEdition') <> 8 /* Azure Managed Instances */
 							BEGIN
 
-							IF (@ProductVersionMajor = 14 AND @ProductVersionMinor < 1000) OR
-							   (@ProductVersionMajor = 13 AND @ProductVersionMinor < 4001) OR
-							   (@ProductVersionMajor = 12 AND @ProductVersionMinor < 5000) OR
+							IF (@ProductVersionMajor = 15 AND @ProductVersionMinor < 2000) OR
+							   (@ProductVersionMajor = 14 AND @ProductVersionMinor < 1000) OR
+							   (@ProductVersionMajor = 13 AND @ProductVersionMinor < 5026) OR
+							   (@ProductVersionMajor = 12 AND @ProductVersionMinor < 6024) OR
 							   (@ProductVersionMajor = 11 AND @ProductVersionMinor < 7001) OR
-							   (@ProductVersionMajor = 10.5 AND @ProductVersionMinor < 6000) OR
-							   (@ProductVersionMajor = 10 AND @ProductVersionMinor < 6000) OR
+							   (@ProductVersionMajor = 10.5 /*AND @ProductVersionMinor < 6000*/) OR
+							   (@ProductVersionMajor = 10 /*AND @ProductVersionMinor < 6000*/) OR
 							   (@ProductVersionMajor = 9 /*AND @ProductVersionMinor <= 5000*/)
 								BEGIN
 								
@@ -3552,10 +3572,10 @@ AS
 								
 								INSERT INTO #BlitzResults(CheckID, Priority, FindingsGroup, Finding, URL, Details)
 									VALUES(128, 20, 'Reliability', 'Unsupported Build of SQL Server', 'https://BrentOzar.com/go/unsupported',
-										'Version ' + CAST(@ProductVersionMajor AS VARCHAR(100)) + '.' +
-										CASE WHEN @ProductVersionMajor > 9 THEN
-										CAST(@ProductVersionMinor AS VARCHAR(100)) + ' is no longer supported by Microsoft. You need to apply a service pack.'
-										ELSE ' is no longer support by Microsoft. You should be making plans to upgrade to a modern version of SQL Server.' END);
+										'Version ' + CAST(@ProductVersionMajor AS VARCHAR(100)) + 
+										CASE WHEN @ProductVersionMajor >= 11 THEN
+										'.' + CAST(@ProductVersionMinor AS VARCHAR(100)) + ' is no longer supported by Microsoft. You need to apply a service pack.'
+										ELSE ' is no longer supported by Microsoft. You should be making plans to upgrade to a modern version of SQL Server.' END);
 								END;
 
 							END;
@@ -3977,7 +3997,7 @@ AS
 		
 								IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 160) WITH NOWAIT;
 								
-								SET @StringToExecute = 'INSERT INTO #BlitzResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
+								SET @StringToExecute = N'INSERT INTO #BlitzResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
 			                        SELECT TOP 1 160 AS CheckID,
 			                        100 AS Priority,
 			                        ''Performance'' AS FindingsGroup,
@@ -3988,8 +4008,14 @@ AS
                                     CROSS APPLY sys.dm_exec_plan_attributes(qs.plan_handle) pa
                                     WHERE pa.attribute = ''dbid''
                                     GROUP BY qs.query_hash, pa.value
-                                    HAVING COUNT(DISTINCT plan_handle) > 50
-									ORDER BY COUNT(DISTINCT plan_handle) DESC OPTION (RECOMPILE);';
+                                    HAVING COUNT(DISTINCT plan_handle) > ';
+
+								IF 50 > (SELECT COUNT(*) FROM sys.databases)
+									SET @StringToExecute = @StringToExecute + N' 50 ';
+								ELSE
+									SELECT @StringToExecute = @StringToExecute + CAST(COUNT(*) * 2 AS NVARCHAR(50)) FROM sys.databases;
+
+								SET @StringToExecute = @StringToExecute + N' ORDER BY COUNT(DISTINCT plan_handle) DESC OPTION (RECOMPILE);';
 		
 								IF @Debug = 2 AND @StringToExecute IS NOT NULL PRINT @StringToExecute;
 								IF @Debug = 2 AND @StringToExecute IS NULL PRINT '@StringToExecute has gone NULL, for some reason.';
@@ -4113,6 +4139,14 @@ AS
 						  SELECT 'is_trustworthy_on', 0, 137, 210, 'Trustworthy Enabled', 'https://BrentOzar.com/go/dbdefaults', NULL
 						  FROM sys.all_columns
 						  WHERE name = 'is_trustworthy_on' AND object_id = OBJECT_ID('sys.databases');
+						INSERT INTO #DatabaseDefaults
+						  SELECT 'is_broker_enabled', 0, 230, 210, 'Broker Enabled', 'https://BrentOzar.com/go/dbdefaults', NULL
+						  FROM sys.all_columns
+						  WHERE name = 'is_broker_enabled' AND object_id = OBJECT_ID('sys.databases');
+						INSERT INTO #DatabaseDefaults
+						  SELECT 'is_honor_broker_priority_on', 0, 231, 210, 'Honor Broker Priority Enabled', 'https://BrentOzar.com/go/dbdefaults', NULL
+						  FROM sys.all_columns
+						  WHERE name = 'is_honor_broker_priority_on' AND object_id = OBJECT_ID('sys.databases');
 						INSERT INTO #DatabaseDefaults
 						  SELECT 'is_parameterization_forced', 0, 138, 210, 'Forced Parameterization Enabled', 'https://BrentOzar.com/go/dbdefaults', NULL
 						  FROM sys.all_columns
@@ -4408,8 +4442,6 @@ BEGIN
                 '    SELECT ''sp_BlitzWho'',''P'',0' + @crlf +
                 '    UNION ALL ' + @crlf +
                 '    SELECT ''sp_DatabaseRestore'',''P'',0' + @crlf +
-                '    UNION ALL ' + @crlf +
-                '    SELECT ''sp_foreachdb'',''P'',0' + @crlf +
                 '    UNION ALL ' + @crlf +
                 '    SELECT ''sp_ineachdb'',''P'',0' + @crlf +
                 '    UNION ALL' + @crlf +
@@ -5381,7 +5413,7 @@ IF @ProductVersionMajor >= 10
 			        50 AS Priority ,
 			        'DBCC Events' AS FindingsGroup ,
 			        'Overall Events' AS Finding ,
-			        '' AS URL ,
+			        'https://www.BrentOzar.com/go/dbcc' AS URL ,
 			        CAST(COUNT(*) AS NVARCHAR(100)) + ' DBCC events have taken place between ' + CONVERT(NVARCHAR(30), MIN(d.min_start_time)) + ' and ' + CONVERT(NVARCHAR(30),  MAX(d.max_start_time)) +
 					'. This does not include CHECKDB and other usually benign DBCC events.'
 					AS Details
@@ -5451,7 +5483,7 @@ IF @ProductVersionMajor >= 10
 					        10 AS Priority ,
 					        'Performance' AS FindingsGroup ,
 					        'DBCC DROPCLEANBUFFERS Ran Recently' AS Finding ,
-					        '' AS URL ,
+					        'https://www.BrentOzar.com/go/dbcc' AS URL ,
 					        'The user ' + COALESCE(d.nt_user_name, d.login_name) + ' has run DBCC DROPCLEANBUFFERS ' + CAST(COUNT(*) AS NVARCHAR(100)) + ' times between ' + CONVERT(NVARCHAR(30), MIN(d.min_start_time)) + ' and ' + CONVERT(NVARCHAR(30),  MAX(d.max_start_time)) +
 							'. If this is a production box, know that you''re clearing all data out of memory when this happens. What kind of monster would do that?'
 							AS Details
@@ -5482,7 +5514,7 @@ IF @ProductVersionMajor >= 10
 					        10 AS Priority ,
 					        'DBCC Events' AS FindingsGroup ,
 					        'DBCC FREEPROCCACHE Ran Recently' AS Finding ,
-					        '' AS URL ,
+					        'https://www.BrentOzar.com/go/dbcc' AS URL ,
 					        'The user ' + COALESCE(d.nt_user_name, d.login_name) + ' has run DBCC FREEPROCCACHE ' + CAST(COUNT(*) AS NVARCHAR(100)) + ' times between ' + CONVERT(NVARCHAR(30), MIN(d.min_start_time)) + ' and ' + CONVERT(NVARCHAR(30),  MAX(d.max_start_time)) +
 							'. This has bad idea jeans written all over its butt, like most other bad idea jeans.'
 							AS Details
@@ -5513,7 +5545,7 @@ IF @ProductVersionMajor >= 10
 					        50 AS Priority ,
 					        'Performance' AS FindingsGroup ,
 					        'Wait Stats Cleared Recently' AS Finding ,
-					        '' AS URL ,
+					        'https://www.BrentOzar.com/go/dbcc' AS URL ,
 					        'The user ' + COALESCE(d.nt_user_name, d.login_name) + ' has run DBCC SQLPERF(''SYS.DM_OS_WAIT_STATS'',CLEAR) ' + CAST(COUNT(*) AS NVARCHAR(100)) + ' times between ' + CONVERT(NVARCHAR(30), MIN(d.min_start_time)) + ' and ' + CONVERT(NVARCHAR(30),  MAX(d.max_start_time)) +
 							'. Why are you clearing wait stats? What are you hiding?'
 							AS Details
@@ -5544,7 +5576,7 @@ IF @ProductVersionMajor >= 10
 						        50 AS Priority ,
 						        'Reliability' AS FindingsGroup ,
 						        'DBCC WRITEPAGE Used Recently' AS Finding ,
-						        '' AS URL ,
+						        'https://www.BrentOzar.com/go/dbcc' AS URL ,
 						        'The user ' + COALESCE(d.nt_user_name, d.login_name) + ' has run DBCC WRITEPAGE ' + CAST(COUNT(*) AS NVARCHAR(100)) + ' times between ' + CONVERT(NVARCHAR(30), MIN(d.min_start_time)) + ' and ' + CONVERT(NVARCHAR(30),  MAX(d.max_start_time)) +
 								'. So, uh, are they trying to fix corruption, or cause corruption?'
 								AS Details
@@ -5575,7 +5607,7 @@ IF @ProductVersionMajor >= 10
 						        10 AS Priority ,
 						        'Performance' AS FindingsGroup ,
 						        'DBCC SHRINK% Ran Recently' AS Finding ,
-						        '' AS URL ,
+						        'https://www.BrentOzar.com/go/dbcc' AS URL ,
 						        'The user ' + COALESCE(d.nt_user_name, d.login_name) + ' has run file shrinks ' + CAST(COUNT(*) AS NVARCHAR(100)) + ' times between ' + CONVERT(NVARCHAR(30), MIN(d.min_start_time)) + ' and ' + CONVERT(NVARCHAR(30),  MAX(d.max_start_time)) +
 								'. So, uh, are they trying cause bad performance on purpose?'
 								AS Details
@@ -5680,7 +5712,7 @@ IF @ProductVersionMajor >= 10
 								WHERE   DatabaseName IS NULL AND CheckID = 221 )
 					BEGIN
 						
-						IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 216) WITH NOWAIT;
+						IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 221) WITH NOWAIT;
 						
 							WITH reboot_airhorn
 							    AS
@@ -5718,7 +5750,7 @@ IF @ProductVersionMajor >= 10
 						AND CAST(SERVERPROPERTY('Edition') AS NVARCHAR(4000)) LIKE '%Evaluation%'
 					BEGIN
 						
-						IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 216) WITH NOWAIT;
+						IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 229) WITH NOWAIT;
 						
 							INSERT  INTO #BlitzResults
 									( CheckID ,
@@ -5738,6 +5770,79 @@ IF @ProductVersionMajor >= 10
 							WHERE sid = 0x010100000000000512000000; 						
 						
 					END;
+
+
+
+
+
+				IF NOT EXISTS ( SELECT  1
+								FROM    #SkipChecks
+								WHERE   DatabaseName IS NULL AND CheckID = 233 )
+					BEGIN
+						
+						IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 233) WITH NOWAIT;
+						
+
+						IF EXISTS (SELECT * FROM sys.all_columns WHERE object_id = OBJECT_ID('sys.dm_os_memory_clerks') AND name = 'pages_kb')
+							BEGIN
+							/* SQL 2012+ version */
+							SET @StringToExecute = N'
+							INSERT  INTO #BlitzResults
+									( CheckID ,
+									  Priority ,
+									  FindingsGroup ,
+									  Finding ,
+									  URL ,
+									  Details
+									)														
+							SELECT 233 AS CheckID,
+							       50 AS Priority,
+							       ''Performance'' AS FindingsGroup,
+							       ''Memory Leak in USERSTORE_TOKENPERM Cache'' AS Finding,
+							       ''https://www.BrentOzar.com/go/userstore'' AS URL,
+							       N''UserStore_TokenPerm clerk is using '' + CAST(CAST(SUM(CASE WHEN type = ''USERSTORE_TOKENPERM'' AND name = ''TokenAndPermUserStore'' THEN pages_kb * 1.0 ELSE 0.0 END) / 1024.0 / 1024.0 AS INT) AS NVARCHAR(100)) 
+								   		+ N''GB RAM, total buffer pool is '' + CAST(CAST(SUM(pages_kb) / 1024.0 / 1024.0 AS INT) AS NVARCHAR(100)) + N''GB.''
+								   AS details
+							FROM sys.dm_os_memory_clerks
+							HAVING SUM(CASE WHEN type = ''USERSTORE_TOKENPERM'' AND name = ''TokenAndPermUserStore'' THEN pages_kb * 1.0 ELSE 0.0 END) / SUM(pages_kb) >= 0.1					
+							  AND SUM(pages_kb) / 1024.0 / 1024.0 >= 1; /* At least 1GB RAM overall */';
+							EXEC sp_executesql @StringToExecute;
+							END
+						ELSE
+							BEGIN
+							/* Antiques Roadshow SQL 2008R2 - version */
+							SET @StringToExecute = N'
+							INSERT  INTO #BlitzResults
+									( CheckID ,
+									  Priority ,
+									  FindingsGroup ,
+									  Finding ,
+									  URL ,
+									  Details
+									)														
+							SELECT 233 AS CheckID,
+							       50 AS Priority,
+							       ''Performance'' AS FindingsGroup,
+							       ''Memory Leak in USERSTORE_TOKENPERM Cache'' AS Finding,
+							       ''https://www.BrentOzar.com/go/userstore'' AS URL,
+							       N''UserStore_TokenPerm clerk is using '' + CAST(CAST(SUM(CASE WHEN type = ''USERSTORE_TOKENPERM'' AND name = ''TokenAndPermUserStore'' THEN single_pages_kb + multi_pages_kb * 1.0 ELSE 0.0 END) / 1024.0 / 1024.0 AS INT) AS NVARCHAR(100)) 
+								   		+ N''GB RAM, total buffer pool is '' + CAST(CAST(SUM(single_pages_kb + multi_pages_kb) / 1024.0 / 1024.0 AS INT) AS NVARCHAR(100)) + N''GB.''
+								   AS details
+							FROM sys.dm_os_memory_clerks
+							HAVING SUM(CASE WHEN type = ''USERSTORE_TOKENPERM'' AND name = ''TokenAndPermUserStore'' THEN single_pages_kb + multi_pages_kb * 1.0 ELSE 0.0 END) / SUM(single_pages_kb + multi_pages_kb) >= 0.1
+							  AND SUM(single_pages_kb + multi_pages_kb) / 1024.0 / 1024.0 >= 1; /* At least 1GB RAM overall */';
+							EXEC sp_executesql @StringToExecute;
+							END
+
+					END;
+
+
+
+
+
+
+
+
 
 
 				IF @CheckUserDatabaseObjects = 1
@@ -8502,6 +8607,46 @@ IF @ProductVersionMajor >= 10 AND  NOT EXISTS ( SELECT  1
                                  END;
                             END;
 
+                        /* CheckID 232 - Server Info - Data Size */
+						IF NOT EXISTS ( SELECT  1
+										FROM    #SkipChecks
+										WHERE   DatabaseName IS NULL AND CheckID = 232 )
+							BEGIN
+								
+								IF @Debug IN (1, 2) RAISERROR('Running CheckId [%d].', 0, 1, 232) WITH NOWAIT;
+                                
+								IF OBJECT_ID('tempdb..#MasterFiles') IS NOT NULL
+									DROP TABLE #MasterFiles;
+								CREATE TABLE #MasterFiles (database_id INT, file_id INT, type_desc NVARCHAR(50), name NVARCHAR(255), physical_name NVARCHAR(255), size BIGINT);
+								/* Azure SQL Database doesn't have sys.master_files, so we have to build our own. */
+								IF ((SERVERPROPERTY('Edition')) = 'SQL Azure' 
+									 AND (OBJECT_ID('sys.master_files') IS NULL))
+									SET @StringToExecute = 'INSERT INTO #MasterFiles (database_id, file_id, type_desc, name, physical_name, size) SELECT DB_ID(), file_id, type_desc, name, physical_name, size FROM sys.database_files;';
+								ELSE
+									SET @StringToExecute = 'INSERT INTO #MasterFiles (database_id, file_id, type_desc, name, physical_name, size) SELECT database_id, file_id, type_desc, name, physical_name, size FROM sys.master_files;';
+								EXEC(@StringToExecute);
+
+
+								INSERT  INTO #BlitzResults
+								    	( CheckID ,
+								    		Priority ,
+								    		FindingsGroup ,
+								    		Finding ,
+											URL ,
+								    		Details
+								    	)
+								    	SELECT  232 AS CheckID
+								    			,250 AS Priority
+								    			,'Server Info' AS FindingsGroup
+								    			,'Data Size' AS Finding
+												,'' AS URL
+								    			,CAST(COUNT(DISTINCT database_id) AS NVARCHAR(100)) + N' databases, ' + CAST(CAST(SUM (CAST(size AS BIGINT)*8./1024./1024.) AS MONEY) AS VARCHAR(100)) + ' GB total file size' as Details
+										FROM #MasterFiles
+										WHERE database_id > 4;
+
+                            END;
+
+
 					END; /* IF @CheckServerInfo = 1 */
 			END; /* IF ( ( SERVERPROPERTY('ServerName') NOT IN ( SELECT ServerName */
 
@@ -8971,6 +9116,13 @@ IF @ProductVersionMajor >= 10 AND  NOT EXISTS ( SELECT  1
 							 END DESC;
 
 	END; /* ELSE -- IF @OutputType = 'SCHEMA' */
+
+	/*
+	Reset the Nmumeric_RoundAbort session state back to enabled if it was disabled earlier. 
+	See Github issue #2302 for more info.
+	*/
+	IF @NeedToTurnNumericRoundabortBackOn = 1
+		SET NUMERIC_ROUNDABORT ON;
 
     SET NOCOUNT OFF;
 GO
